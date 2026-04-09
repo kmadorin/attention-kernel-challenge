@@ -182,6 +182,9 @@ def block_sparse_attn_fwd(q, k, v, row_ptr, col_idx, seq_lens):
     output = out_blocks.reshape(batch_heads, t_max, head_dim)
     lse = lse_blocks.reshape(batch_heads, t_max)
 
-    return output.reshape(batch_size, num_heads, t_max, head_dim).to(torch.bfloat16), lse.reshape(
+    # Return fp32 output (not bf16) — the harness casts both candidate and
+    # reference to fp32 before allclose, so keeping fp32 preserves precision
+    # and saves a ~384 MB cast pass on full-suite shapes.
+    return output.reshape(batch_size, num_heads, t_max, head_dim), lse.reshape(
         batch_size, num_heads, t_max
     )
