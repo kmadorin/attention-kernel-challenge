@@ -34,6 +34,7 @@ COMPILER_TRANSITIVE_ROOTS = {
     "networkx",
     "colorama",
     "functorch",
+    "torchgen",
 }
 MAX_SUBMISSION_ARCHIVE_BYTES = 10 * 1024 * 1024
 MAX_SUBMISSION_FILE_COUNT = 128
@@ -387,7 +388,7 @@ def _submission_import_guard(local_modules: Set[str]) -> Iterator[None]:
         importer_name = None
         importer_globals = None
         importer_filename = None
-        trusted_import = False
+        trusted_import = trusted_depth > 0
         result = None
         if level == 0:
             importer_name, importer_globals, importer_filename = _resolve_importer_context(globals)
@@ -410,7 +411,7 @@ def _submission_import_guard(local_modules: Set[str]) -> Iterator[None]:
 
     def guarded_import_module(name: str, package: str | None = None):
         nonlocal trusted_depth
-        trusted_import = False
+        trusted_import = trusted_depth > 0
         result = None
         if not name.startswith("."):
             importer_name, importer_globals, importer_filename = _resolve_importer_context(None)
