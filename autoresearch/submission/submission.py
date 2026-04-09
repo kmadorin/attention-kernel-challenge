@@ -125,14 +125,17 @@ def block_sparse_attn_fwd(q, k, v, row_ptr, col_idx, seq_lens):
     # exp(-inf)=0 makes the post-softmax zeroing automatic, saving an entire
     # 4D fp32 allocation and a pointwise multiply pass over it.
     neg_inf = float("-inf")
-    key_bias = torch.where(key_valid, 0.0, neg_inf).to(torch.float32)  # (bh, nq, md*BS)
-    query_bias = torch.where(query_valid, 0.0, neg_inf).to(torch.float32)  # (bh, nq, BS)
-
-    scores.add_(key_bias[:, :, None, :])
-    scores.add_(query_bias[:, :, :, None])
-    # Build inverse causal directly (key_pos > q_pos) so we skip a `~` pass.
-    causal_violated = key_positions[:, :, None, :] > q_positions_per_block[None, :, :, None]
-    scores.masked_fill_(causal_violated, neg_inf)
+    # Fuse all three invalidation conditions (key padding, query padding,
+    # causal violation) into a single boolean 4D tensor and apply with one
+    # masked_fill_. Saves two fp32 4D read-write passes vs separate add_ ops.
+    key_invalid = ~key_valid  # (bh, nq, md*BS) bool
+    query_invalid = ~query_valid  # (bh, nq, BS) bool
+    invalid_4d = (
+        key_invalid[:, :, None, :]
+        | query_invalid[:, :, :, None]
+        | (key_positions[:, :, None, :] > q_positions_per_block[None, :, :, None])
+    )
+    scores.masked_fill_(invalid_4d, neg_inf)
 
     row_max = torch.max(scores, dim=-1).values  # (bh, nq, BLOCK_SIZE)
     valid_rows = query_valid & torch.isfinite(row_max)
