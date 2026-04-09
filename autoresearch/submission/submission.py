@@ -28,9 +28,11 @@ def block_sparse_attn_fwd(q, k, v, row_ptr, col_idx, seq_lens):
     num_q_blocks = row_ptr.shape[-1] - 1
     num_k_blocks = t_max // BLOCK_SIZE
 
-    q_f = q.to(torch.float32).reshape(batch_heads, t_max, head_dim)
-    k_blocks = k.to(torch.float32).reshape(batch_heads, num_k_blocks, BLOCK_SIZE, head_dim)
-    v_blocks = v.to(torch.float32).reshape(batch_heads, num_k_blocks, BLOCK_SIZE, head_dim)
+    # CUDA path uses fp16 tensor-core SDPA; CPU path needs fp32 manual softmax.
+    compute_dtype = torch.float16 if q.is_cuda else torch.float32
+    q_f = q.to(compute_dtype).reshape(batch_heads, t_max, head_dim)
+    k_blocks = k.to(compute_dtype).reshape(batch_heads, num_k_blocks, BLOCK_SIZE, head_dim)
+    v_blocks = v.to(compute_dtype).reshape(batch_heads, num_k_blocks, BLOCK_SIZE, head_dim)
 
     flat_k_blocks = k_blocks.reshape(batch_heads * num_k_blocks, BLOCK_SIZE, head_dim)
     flat_v_blocks = v_blocks.reshape(batch_heads * num_k_blocks, BLOCK_SIZE, head_dim)
@@ -132,9 +134,9 @@ def block_sparse_attn_fwd(q, k, v, row_ptr, col_idx, seq_lens):
             torch.tensor(0.0, device=device, dtype=torch.float16),
         )
         B = batch_heads * nq
-        q_for_sdpa = q_chunks.reshape(B, 1, BLOCK_SIZE, head_dim).to(torch.float16)
-        k_for_sdpa = gathered_k.reshape(B, 1, md * BLOCK_SIZE, head_dim).to(torch.float16)
-        v_for_sdpa = gathered_v.reshape(B, 1, md * BLOCK_SIZE, head_dim).to(torch.float16)
+        q_for_sdpa = q_chunks.reshape(B, 1, BLOCK_SIZE, head_dim)
+        k_for_sdpa = gathered_k.reshape(B, 1, md * BLOCK_SIZE, head_dim)
+        v_for_sdpa = gathered_v.reshape(B, 1, md * BLOCK_SIZE, head_dim)
         bias_for_sdpa = attn_bias.reshape(B, 1, BLOCK_SIZE, md * BLOCK_SIZE)
         out_sdpa, lse_sdpa, _seed, _offset = torch.ops.aten._scaled_dot_product_efficient_attention(
             q_for_sdpa,
