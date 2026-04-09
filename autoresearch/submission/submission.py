@@ -39,103 +39,119 @@ def block_sparse_attn_fwd(q, k, v, row_ptr, col_idx, seq_lens):
     col_idx_2d = col_idx.reshape(batch_heads, -1).to(torch.int64)
     seq_lens_2d = seq_lens[:, None].expand(batch_size, num_heads).reshape(batch_heads).to(torch.int64)
 
-    output = torch.zeros((batch_heads, t_max, head_dim), device=device, dtype=torch.float32)
-    lse = torch.full((batch_heads, t_max), -torch.inf, device=device, dtype=torch.float32)
-
-    batch_head_block_base = (
-        torch.arange(batch_heads, device=device, dtype=torch.int64)[:, None] * num_k_blocks
-    )
     block_token_offsets = torch.arange(BLOCK_SIZE, device=device, dtype=torch.int64)
 
-    # Compute the maximum degree across ALL q_blocks once per call. This costs
-    # exactly one host/device sync per call (vs num_q_blocks syncs in the
-    # original loop) and lets us pad every q_block to the same `max_degree`,
-    # which keeps shapes constant inside the loop and lets the GPU pipeline
-    # actually run async between iterations.
-    all_degrees = row_ptr_2d[:, 1:] - row_ptr_2d[:, :-1]  # (bh, num_q_blocks)
+    # Compute the maximum degree across all (bh, q_block) once. Pad every
+    # q_block to this constant. One single host sync per call.
+    all_degrees = row_ptr_2d[:, 1:] - row_ptr_2d[:, :-1]  # (bh, nq)
     max_degree = int(all_degrees.max().item())
     if max_degree <= 0:
-        return output.reshape(batch_size, num_heads, t_max, head_dim).to(torch.bfloat16), lse.reshape(
+        empty_out = torch.zeros((batch_heads, t_max, head_dim), device=device, dtype=torch.float32)
+        empty_lse = torch.full((batch_heads, t_max), -torch.inf, device=device, dtype=torch.float32)
+        return empty_out.reshape(batch_size, num_heads, t_max, head_dim).to(torch.bfloat16), empty_lse.reshape(
             batch_size, num_heads, t_max
         )
-    slot_offsets = torch.arange(max_degree, device=device, dtype=torch.int64)[None, :]
 
-    for q_block in range(num_q_blocks):
-        q_start = q_block * BLOCK_SIZE
-        q_end = q_start + BLOCK_SIZE
-        q_chunk = q_f[:, q_start:q_end]
+    nq = num_q_blocks
+    md = max_degree
 
-        row_start = row_ptr_2d[:, q_block]
-        row_end = row_ptr_2d[:, q_block + 1]
-        degrees = row_end - row_start
+    # Slot offsets: (1, 1, md)
+    slot_offsets = torch.arange(md, device=device, dtype=torch.int64)[None, None, :]
+    # row_starts: (bh, nq, 1)
+    row_starts = row_ptr_2d[:, :nq, None]
+    # gather positions in the (bh, max_nnz) col_idx_2d table.
+    max_nnz = col_idx_2d.shape[1]
+    gather_positions = torch.clamp(row_starts + slot_offsets, max=max_nnz - 1)  # (bh, nq, md)
+    # 3-way gather across the col_idx table.
+    col_idx_expanded = col_idx_2d[:, None, :].expand(batch_heads, nq, max_nnz)
+    gathered_block_indices = torch.gather(col_idx_expanded, 2, gather_positions)  # (bh, nq, md)
 
-        slot_valid = slot_offsets < degrees[:, None]
-        gather_positions = torch.clamp(row_start[:, None] + slot_offsets, max=col_idx_2d.shape[1] - 1)
-        gathered_block_indices = torch.gather(col_idx_2d, 1, gather_positions)
-        gathered_block_indices = torch.where(
-            slot_valid,
-            gathered_block_indices,
-            torch.zeros_like(gathered_block_indices),
-        )
+    slot_valid = slot_offsets < all_degrees[:, :, None]  # (bh, nq, md)
+    gathered_block_indices = torch.where(
+        slot_valid,
+        gathered_block_indices,
+        torch.zeros_like(gathered_block_indices),
+    )
 
-        flat_block_indices = batch_head_block_base + gathered_block_indices
-        gathered_k_blocks = flat_k_blocks.index_select(0, flat_block_indices.reshape(-1)).reshape(
-            batch_heads, max_degree, BLOCK_SIZE, head_dim
-        )
-        gathered_v_blocks = flat_v_blocks.index_select(0, flat_block_indices.reshape(-1)).reshape(
-            batch_heads, max_degree, BLOCK_SIZE, head_dim
-        )
+    # Resolve to flat (bh*num_k_blocks) indices for K/V gather.
+    bh_block_base = (
+        torch.arange(batch_heads, device=device, dtype=torch.int64) * num_k_blocks
+    )[:, None, None]  # (bh, 1, 1)
+    flat_block_indices = (bh_block_base + gathered_block_indices).reshape(-1)  # (bh*nq*md,)
 
-        key_positions = (
-            gathered_block_indices[:, :, None] * BLOCK_SIZE + block_token_offsets[None, None, :]
-        ).reshape(batch_heads, max_degree * BLOCK_SIZE)
-        key_valid = (
-            slot_valid[:, :, None] & (key_positions.reshape(batch_heads, max_degree, BLOCK_SIZE) < seq_lens_2d[:, None, None])
-        ).reshape(batch_heads, max_degree * BLOCK_SIZE)
-        diag_key = (
-            (gathered_block_indices == q_block)[:, :, None]
-            .expand(batch_heads, max_degree, BLOCK_SIZE)
-            .reshape(batch_heads, max_degree * BLOCK_SIZE)
-        )
+    # Gather K/V tiles: (bh, nq, md, BLOCK_SIZE, head_dim) -> (bh, nq, md*BLOCK_SIZE, head_dim)
+    gathered_k = flat_k_blocks.index_select(0, flat_block_indices).reshape(
+        batch_heads, nq, md * BLOCK_SIZE, head_dim
+    )
+    gathered_v = flat_v_blocks.index_select(0, flat_block_indices).reshape(
+        batch_heads, nq, md * BLOCK_SIZE, head_dim
+    )
 
-        q_positions = q_start + block_token_offsets[None, :]
-        query_valid = q_positions < seq_lens_2d[:, None]
+    # Q chunks: (bh, nq, BLOCK_SIZE, head_dim)
+    q_chunks = q_f.reshape(batch_heads, nq, BLOCK_SIZE, head_dim)
 
-        k_tokens = gathered_k_blocks.reshape(batch_heads, max_degree * BLOCK_SIZE, head_dim)
-        v_tokens = gathered_v_blocks.reshape(batch_heads, max_degree * BLOCK_SIZE, head_dim)
+    # Scores: (bh, nq, BLOCK_SIZE, md*BLOCK_SIZE)
+    scores = torch.matmul(q_chunks, gathered_k.transpose(-1, -2)) * SCALE
 
-        scores = torch.matmul(q_chunk, k_tokens.transpose(1, 2)) * SCALE
+    # --- Build the boolean mask -----------------------------------------------
+    # Key absolute positions: (bh, nq, md*BLOCK_SIZE)
+    key_positions = (
+        gathered_block_indices[:, :, :, None] * BLOCK_SIZE + block_token_offsets[None, None, None, :]
+    ).reshape(batch_heads, nq, md * BLOCK_SIZE)
+    key_padding_ok = key_positions < seq_lens_2d[:, None, None]
+    slot_valid_tokens = (
+        slot_valid[:, :, :, None]
+        .expand(batch_heads, nq, md, BLOCK_SIZE)
+        .reshape(batch_heads, nq, md * BLOCK_SIZE)
+    )
+    key_valid = slot_valid_tokens & key_padding_ok  # (bh, nq, md*BLOCK_SIZE)
 
-        mask = key_valid[:, None, :] & query_valid[:, :, None]
-        causal_ok = key_positions[:, None, :] <= q_positions[:, :, None]
-        mask = mask & ((~diag_key)[:, None, :] | causal_ok)
+    # Q positions per (nq, BLOCK_SIZE)
+    q_positions_per_block = (
+        torch.arange(nq, device=device, dtype=torch.int64)[:, None] * BLOCK_SIZE
+        + block_token_offsets[None, :]
+    )  # (nq, BLOCK_SIZE)
+    query_valid = q_positions_per_block[None, :, :] < seq_lens_2d[:, None, None]  # (bh, nq, BLOCK_SIZE)
 
-        scores = scores.masked_fill(~mask, -torch.inf)
-        row_max = torch.max(scores, dim=-1).values
-        valid_rows = query_valid & torch.isfinite(row_max)
-        row_max_safe = torch.where(valid_rows, row_max, torch.zeros_like(row_max))
+    # Diagonal-block detection: gathered_block == this row's q_block.
+    q_block_idx = torch.arange(nq, device=device, dtype=torch.int64)[None, :, None]  # (1, nq, 1)
+    diag_key = gathered_block_indices == q_block_idx  # (bh, nq, md)
+    diag_key_tokens = (
+        diag_key[:, :, :, None]
+        .expand(batch_heads, nq, md, BLOCK_SIZE)
+        .reshape(batch_heads, nq, md * BLOCK_SIZE)
+    )
 
-        exp_scores = torch.exp(scores - row_max_safe[:, :, None]) * mask.to(torch.float32)
-        denom = exp_scores.sum(dim=-1)
-        denom_safe = torch.where(valid_rows, denom, torch.ones_like(denom))
+    # mask: (bh, nq, BLOCK_SIZE_q, md*BLOCK_SIZE_k)
+    mask = key_valid[:, :, None, :] & query_valid[:, :, :, None]
+    causal_ok = key_positions[:, :, None, :] <= q_positions_per_block[None, :, :, None]
+    mask = mask & ((~diag_key_tokens)[:, :, None, :] | causal_ok)
 
-        out_block = torch.matmul(exp_scores, v_tokens) / denom_safe[:, :, None]
-        lse_block = torch.where(
-            valid_rows,
-            row_max_safe + torch.log(denom_safe),
-            torch.full_like(row_max_safe, -torch.inf),
-        )
+    scores = scores.masked_fill(~mask, -torch.inf)
+    row_max = torch.max(scores, dim=-1).values  # (bh, nq, BLOCK_SIZE)
+    valid_rows = query_valid & torch.isfinite(row_max)
+    row_max_safe = torch.where(valid_rows, row_max, torch.zeros_like(row_max))
 
-        output[:, q_start:q_end] = torch.where(
-            valid_rows[:, :, None],
-            out_block,
-            output[:, q_start:q_end],
-        )
-        lse[:, q_start:q_end] = torch.where(
-            valid_rows,
-            lse_block,
-            lse[:, q_start:q_end],
-        )
+    exp_scores = torch.exp(scores - row_max_safe[:, :, :, None]) * mask.to(torch.float32)
+    denom = exp_scores.sum(dim=-1)  # (bh, nq, BLOCK_SIZE)
+    denom_safe = torch.where(valid_rows, denom, torch.ones_like(denom))
+
+    out_blocks = torch.matmul(exp_scores, gathered_v) / denom_safe[:, :, :, None]  # (bh, nq, BLOCK_SIZE, head_dim)
+    lse_blocks = torch.where(
+        valid_rows,
+        row_max_safe + torch.log(denom_safe),
+        torch.full_like(row_max_safe, -torch.inf),
+    )
+
+    # Mask out invalid query rows in the output.
+    out_blocks = torch.where(
+        valid_rows[:, :, :, None],
+        out_blocks,
+        torch.zeros_like(out_blocks),
+    )
+
+    output = out_blocks.reshape(batch_heads, t_max, head_dim)
+    lse = lse_blocks.reshape(batch_heads, t_max)
 
     return output.reshape(batch_size, num_heads, t_max, head_dim).to(torch.bfloat16), lse.reshape(
         batch_size, num_heads, t_max
