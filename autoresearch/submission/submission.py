@@ -113,19 +113,16 @@ def block_sparse_attn_fwd(q, k, v, row_ptr, col_idx, seq_lens):
     )  # (nq, BLOCK_SIZE)
     query_valid = q_positions_per_block[None, :, :] < seq_lens_2d[:, None, None]  # (bh, nq, BLOCK_SIZE)
 
-    # Diagonal-block detection: gathered_block == this row's q_block.
-    q_block_idx = torch.arange(nq, device=device, dtype=torch.int64)[None, :, None]  # (1, nq, 1)
-    diag_key = gathered_block_indices == q_block_idx  # (bh, nq, md)
-    diag_key_tokens = (
-        diag_key[:, :, :, None]
-        .expand(batch_heads, nq, md, BLOCK_SIZE)
-        .reshape(batch_heads, nq, md * BLOCK_SIZE)
+    # cases.py guarantees col_idx[q_block] only contains blocks <= q_block, so
+    # an unconditional `key_pos <= q_pos` check is a no-op for non-diagonal
+    # blocks and correctly enforces causal masking inside the diagonal block.
+    # We fold all conditions into a single (bh, nq, BLOCK_SIZE_q, md*BLOCK_SIZE_k)
+    # boolean built in one fused expression to minimize intermediate allocations.
+    mask = (
+        key_valid[:, :, None, :]
+        & query_valid[:, :, :, None]
+        & (key_positions[:, :, None, :] <= q_positions_per_block[None, :, :, None])
     )
-
-    # mask: (bh, nq, BLOCK_SIZE_q, md*BLOCK_SIZE_k)
-    mask = key_valid[:, :, None, :] & query_valid[:, :, :, None]
-    causal_ok = key_positions[:, :, None, :] <= q_positions_per_block[None, :, :, None]
-    mask = mask & ((~diag_key_tokens)[:, :, None, :] | causal_ok)
 
     scores = scores.masked_fill(~mask, -torch.inf)
     row_max = torch.max(scores, dim=-1).values  # (bh, nq, BLOCK_SIZE)
