@@ -13,6 +13,29 @@ VARIANT_MANIFEST = [
     }
 ]
 
+# Module-level cache for shape-dependent helper tensors. Each call would
+# otherwise launch ~5 small kernels just to build arange/position grids;
+# caching them eliminates that fixed per-call CUDA launch overhead.
+_HELPER_CACHE: dict = {}
+
+
+def _get_helpers(nq: int, batch_heads: int, num_k_blocks: int, device):
+    key = (nq, batch_heads, num_k_blocks, device)
+    cached = _HELPER_CACHE.get(key)
+    if cached is not None:
+        return cached
+    block_token_offsets = torch.arange(BLOCK_SIZE, device=device, dtype=torch.int64)
+    q_positions_per_block = (
+        torch.arange(nq, device=device, dtype=torch.int64)[:, None] * BLOCK_SIZE
+        + block_token_offsets[None, :]
+    )
+    bh_block_base = (
+        torch.arange(batch_heads, device=device, dtype=torch.int64) * num_k_blocks
+    )[:, None, None]
+    cached = (block_token_offsets, q_positions_per_block, bh_block_base)
+    _HELPER_CACHE[key] = cached
+    return cached
+
 
 def setup(suite_specs, device, variants):
     return None
@@ -41,7 +64,10 @@ def block_sparse_attn_fwd(q, k, v, row_ptr, col_idx, seq_lens):
     col_idx_2d = col_idx.reshape(batch_heads, -1).to(torch.int64)
     seq_lens_2d = seq_lens[:, None].expand(batch_size, num_heads).reshape(batch_heads).to(torch.int64)
 
-    block_token_offsets = torch.arange(BLOCK_SIZE, device=device, dtype=torch.int64)
+    nq_known = num_q_blocks
+    block_token_offsets, q_positions_per_block, bh_block_base = _get_helpers(
+        nq_known, batch_heads, num_k_blocks, device
+    )
 
     # Compute the maximum degree across all (bh, q_block) once. Pad every
     # q_block to this constant. One single host sync per call.
@@ -75,10 +101,8 @@ def block_sparse_attn_fwd(q, k, v, row_ptr, col_idx, seq_lens):
         torch.zeros_like(gathered_block_indices),
     )
 
-    # Resolve to flat (bh*num_k_blocks) indices for K/V gather.
-    bh_block_base = (
-        torch.arange(batch_heads, device=device, dtype=torch.int64) * num_k_blocks
-    )[:, None, None]  # (bh, 1, 1)
+    # Resolve to flat (bh*num_k_blocks) indices for K/V gather (bh_block_base
+    # comes from the per-shape helper cache).
     flat_block_indices = (bh_block_base + gathered_block_indices).reshape(-1)  # (bh*nq*md,)
 
     # Gather K/V tiles: (bh, nq, md, BLOCK_SIZE, head_dim) -> (bh, nq, md*BLOCK_SIZE, head_dim)
@@ -105,10 +129,6 @@ def block_sparse_attn_fwd(q, k, v, row_ptr, col_idx, seq_lens):
     key_valid = slot_valid_tokens & key_padding_ok
     key_invalid = ~key_valid
 
-    q_positions_per_block = (
-        torch.arange(nq, device=device, dtype=torch.int64)[:, None] * BLOCK_SIZE
-        + block_token_offsets[None, :]
-    )
     query_valid = q_positions_per_block[None, :, :] < seq_lens_2d[:, None, None]
 
     invalid_4d = key_invalid[:, :, None, :] | (
