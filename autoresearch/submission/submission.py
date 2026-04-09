@@ -118,12 +118,14 @@ def block_sparse_attn_fwd(q, k, v, row_ptr, col_idx, seq_lens):
         # CUDA path: use the fused efficient attention kernel. Saves the
         # ~2 GB scores materialization and delivers output + LSE in one
         # call.
-        attn_bias = torch.zeros(
-            (batch_heads, nq, BLOCK_SIZE, md * BLOCK_SIZE),
-            device=device,
-            dtype=torch.float32,
+        # Build the float bias in ONE write pass via torch.where (vs
+        # torch.zeros + masked_fill_, which is two passes over the ~2 GB
+        # tensor on full-suite shapes).
+        attn_bias = torch.where(
+            invalid_4d,
+            torch.tensor(neg_inf, device=device, dtype=torch.float32),
+            torch.tensor(0.0, device=device, dtype=torch.float32),
         )
-        attn_bias.masked_fill_(invalid_4d, neg_inf)
         B = batch_heads * nq
         q_for_sdpa = q_chunks.reshape(B, 1, BLOCK_SIZE, head_dim)
         k_for_sdpa = gathered_k.reshape(B, 1, md * BLOCK_SIZE, head_dim)
