@@ -90,14 +90,7 @@ def block_sparse_attn_fwd(q, k, v, row_ptr, col_idx, seq_lens):
     # Q chunks: (bh, nq, BLOCK_SIZE, head_dim)
     q_chunks = q_f.reshape(batch_heads, nq, BLOCK_SIZE, head_dim)
 
-    # Scores: (bh, nq, BLOCK_SIZE, md*BLOCK_SIZE). The matmul result is the
-    # only fresh fp32 4D tensor we need; everything downstream mutates it
-    # in place to avoid extra ~2 GB temporaries on full-suite shapes.
-    scores = torch.matmul(q_chunks, gathered_k.transpose(-1, -2))
-    scores.mul_(SCALE)
-
-    # --- Build the boolean mask -----------------------------------------------
-    # Key absolute positions: (bh, nq, md*BLOCK_SIZE)
+    # --- Build mask components (shared between paths) ------------------------
     key_positions = (
         gathered_block_indices[:, :, :, None] * BLOCK_SIZE + block_token_offsets[None, None, None, :]
     ).reshape(batch_heads, nq, md * BLOCK_SIZE)
@@ -107,60 +100,82 @@ def block_sparse_attn_fwd(q, k, v, row_ptr, col_idx, seq_lens):
         .expand(batch_heads, nq, md, BLOCK_SIZE)
         .reshape(batch_heads, nq, md * BLOCK_SIZE)
     )
-    key_valid = slot_valid_tokens & key_padding_ok  # (bh, nq, md*BLOCK_SIZE)
+    key_valid = slot_valid_tokens & key_padding_ok
+    key_invalid = ~key_valid
 
-    # Q positions per (nq, BLOCK_SIZE)
     q_positions_per_block = (
         torch.arange(nq, device=device, dtype=torch.int64)[:, None] * BLOCK_SIZE
         + block_token_offsets[None, :]
-    )  # (nq, BLOCK_SIZE)
-    query_valid = q_positions_per_block[None, :, :] < seq_lens_2d[:, None, None]  # (bh, nq, BLOCK_SIZE)
+    )
+    query_valid = q_positions_per_block[None, :, :] < seq_lens_2d[:, None, None]
 
-    # cases.py guarantees col_idx[q_block] only contains blocks <= q_block, so
-    # the unconditional `key_pos <= q_pos` check is a no-op for non-diagonal
-    # blocks and correctly enforces causal masking inside the diagonal block.
-    #
-    # Instead of building a boolean mask + masked_fill + (exp_scores * mask),
-    # we add an additive bias that is 0 where allowed and -inf where not.
-    # exp(-inf)=0 makes the post-softmax zeroing automatic, saving an entire
-    # 4D fp32 allocation and a pointwise multiply pass over it.
-    neg_inf = float("-inf")
-    # Combine key padding + causal violation into one boolean 4D tensor and
-    # apply with a single masked_fill_. We deliberately drop the query_invalid
-    # term: the post-loop zeroing of out_blocks/lse_blocks already handles
-    # invalid query rows, so masking them in `scores` would just be redundant
-    # bandwidth.
-    key_invalid = ~key_valid  # (bh, nq, md*BS) bool
     invalid_4d = key_invalid[:, :, None, :] | (
         key_positions[:, :, None, :] > q_positions_per_block[None, :, :, None]
     )
-    scores.masked_fill_(invalid_4d, neg_inf)
+    neg_inf = float("-inf")
 
-    row_max = torch.max(scores, dim=-1).values  # (bh, nq, BLOCK_SIZE)
-    valid_rows = query_valid & torch.isfinite(row_max)
-    row_max_safe = torch.where(valid_rows, row_max, torch.zeros_like(row_max))
-
-    # exp(-inf) = 0 → masked positions contribute 0 to sum and to exp@v, so no
-    # explicit mask multiply is needed. Mutate `scores` in place.
-    scores.sub_(row_max_safe[:, :, :, None])
-    scores.exp_()
-    exp_scores = scores  # alias; `scores` is no longer needed
-    denom = exp_scores.sum(dim=-1)  # (bh, nq, BLOCK_SIZE)
-    denom_safe = torch.where(valid_rows, denom, torch.ones_like(denom))
-
-    out_blocks = torch.matmul(exp_scores, gathered_v) / denom_safe[:, :, :, None]  # (bh, nq, BLOCK_SIZE, head_dim)
-    lse_blocks = torch.where(
-        valid_rows,
-        row_max_safe + torch.log(denom_safe),
-        torch.full_like(row_max_safe, -torch.inf),
-    )
-
-    # Mask out invalid query rows in the output.
-    out_blocks = torch.where(
-        valid_rows[:, :, :, None],
-        out_blocks,
-        torch.zeros_like(out_blocks),
-    )
+    if q.is_cuda:
+        # CUDA path: use the fused efficient attention kernel. Saves the
+        # ~2 GB scores materialization and delivers output + LSE in one
+        # call.
+        attn_bias = torch.zeros(
+            (batch_heads, nq, BLOCK_SIZE, md * BLOCK_SIZE),
+            device=device,
+            dtype=torch.float32,
+        )
+        attn_bias.masked_fill_(invalid_4d, neg_inf)
+        B = batch_heads * nq
+        q_for_sdpa = q_chunks.reshape(B, 1, BLOCK_SIZE, head_dim)
+        k_for_sdpa = gathered_k.reshape(B, 1, md * BLOCK_SIZE, head_dim)
+        v_for_sdpa = gathered_v.reshape(B, 1, md * BLOCK_SIZE, head_dim)
+        bias_for_sdpa = attn_bias.reshape(B, 1, BLOCK_SIZE, md * BLOCK_SIZE)
+        out_sdpa, lse_sdpa, _seed, _offset = torch.ops.aten._scaled_dot_product_efficient_attention(
+            q_for_sdpa,
+            k_for_sdpa,
+            v_for_sdpa,
+            bias_for_sdpa,
+            True,   # compute_log_sumexp
+            0.0,    # dropout_p
+            False,  # is_causal
+            scale=SCALE,
+        )
+        out_blocks = out_sdpa.reshape(batch_heads, nq, BLOCK_SIZE, head_dim)
+        lse_blocks = lse_sdpa.reshape(batch_heads, nq, BLOCK_SIZE)
+        # Zero / -inf invalid query rows (SDPA may leak garbage into them).
+        out_blocks = torch.where(
+            query_valid[:, :, :, None],
+            out_blocks,
+            torch.zeros_like(out_blocks),
+        )
+        lse_blocks = torch.where(
+            query_valid,
+            lse_blocks,
+            torch.full_like(lse_blocks, -torch.inf),
+        )
+    else:
+        # CPU fallback: manual fp32 path (same as prior best).
+        scores = torch.matmul(q_chunks, gathered_k.transpose(-1, -2))
+        scores.mul_(SCALE)
+        scores.masked_fill_(invalid_4d, neg_inf)
+        row_max = torch.max(scores, dim=-1).values
+        valid_rows = query_valid & torch.isfinite(row_max)
+        row_max_safe = torch.where(valid_rows, row_max, torch.zeros_like(row_max))
+        scores.sub_(row_max_safe[:, :, :, None])
+        scores.exp_()
+        exp_scores = scores
+        denom = exp_scores.sum(dim=-1)
+        denom_safe = torch.where(valid_rows, denom, torch.ones_like(denom))
+        out_blocks = torch.matmul(exp_scores, gathered_v) / denom_safe[:, :, :, None]
+        lse_blocks = torch.where(
+            valid_rows,
+            row_max_safe + torch.log(denom_safe),
+            torch.full_like(row_max_safe, -torch.inf),
+        )
+        out_blocks = torch.where(
+            valid_rows[:, :, :, None],
+            out_blocks,
+            torch.zeros_like(out_blocks),
+        )
 
     output = out_blocks.reshape(batch_heads, t_max, head_dim)
     lse = lse_blocks.reshape(batch_heads, t_max)
