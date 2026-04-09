@@ -54,6 +54,18 @@ def _get_scalars(device):
 _SLOT_OFFSETS_CACHE: dict = {}
 
 
+def _build_bias_eager(key_invalid_3d, key_positions_3d, q_positions_2d, neg_inf_h, zero_h):
+    invalid_4d = key_invalid_3d[:, :, None, :] | (
+        key_positions_3d[:, :, None, :] > q_positions_2d[None, :, :, None]
+    )
+    return torch.where(invalid_4d, neg_inf_h, zero_h)
+
+
+# Replaced in setup() with a torch.compile'd version that fuses the OR
+# + where into one kernel, eliminating the 1 GB bool intermediate.
+_build_bias = _build_bias_eager
+
+
 def _get_slot_offsets(md: int, device):
     key = (md, device)
     cached = _SLOT_OFFSETS_CACHE.get(key)
@@ -65,6 +77,53 @@ def _get_slot_offsets(md: int, device):
 
 
 def setup(suite_specs, device, variants):
+    if device != "cuda":
+        return None
+    # Compile the bias-build helper once with dynamic shapes; pre-warm with
+    # a representative input so the first measure call doesn't pay compile
+    # latency. Falls back to eager if compile fails.
+    global _build_bias
+    try:
+        compiled = torch.compile(
+            _build_bias_eager,
+            dynamic=True,
+            fullgraph=True,
+            mode="default",
+        )
+        # Pre-warm with the largest shape we'll see, so subsequent calls
+        # reuse the same compiled artifact.
+        max_bh = 1
+        max_nq = 1
+        max_md = 1
+        for case_spec in suite_specs:
+            nq = case_spec.t_max // BLOCK_SIZE
+            bh = case_spec.batch_size * case_spec.num_heads
+            md_ub = max(
+                1,
+                min(
+                    nq,
+                    case_spec.window_blocks
+                    + case_spec.global_blocks
+                    + case_spec.retrieval_blocks,
+                ),
+            )
+            if bh > max_bh:
+                max_bh = bh
+            if nq > max_nq:
+                max_nq = nq
+            if md_ub > max_md:
+                max_md = md_ub
+        dev = torch.device(device)
+        ki = torch.zeros((max_bh, max_nq, max_md * BLOCK_SIZE), dtype=torch.bool, device=dev)
+        kp = torch.zeros((max_bh, max_nq, max_md * BLOCK_SIZE), dtype=torch.int64, device=dev)
+        qp = torch.zeros((max_nq, BLOCK_SIZE), dtype=torch.int64, device=dev)
+        nh = torch.tensor(float("-inf"), dtype=torch.float16, device=dev)
+        zh = torch.tensor(0.0, dtype=torch.float16, device=dev)
+        compiled(ki, kp, qp, nh, zh)  # trigger compile
+        torch.cuda.synchronize()
+        _build_bias = compiled
+    except Exception:
+        _build_bias = _build_bias_eager
     return None
 
 
@@ -156,9 +215,6 @@ def block_sparse_attn_fwd(q, k, v, row_ptr, col_idx, seq_lens):
 
     query_valid = q_positions_per_block[None, :, :] < seq_lens_2d[:, None, None]
 
-    invalid_4d = key_invalid[:, :, None, :] | (
-        key_positions[:, :, None, :] > q_positions_per_block[None, :, :, None]
-    )
     neg_inf = float("-inf")
 
     if q.is_cuda:
@@ -174,7 +230,9 @@ def block_sparse_attn_fwd(q, k, v, row_ptr, col_idx, seq_lens):
         # mantissa bits → ~5e-4 quantization noise on the output, well
         # under the 1e-3 atol. LSE is still returned in fp32.
         neg_inf_h, zero_h = _get_scalars(device)
-        attn_bias = torch.where(invalid_4d, neg_inf_h, zero_h)
+        attn_bias = _build_bias(
+            key_invalid, key_positions, q_positions_per_block, neg_inf_h, zero_h
+        )
         B = batch_heads * nq
         q_for_sdpa = q_chunks.reshape(B, 1, BLOCK_SIZE, head_dim)
         k_for_sdpa = gathered_k.reshape(B, 1, md * BLOCK_SIZE, head_dim)
@@ -205,6 +263,9 @@ def block_sparse_attn_fwd(q, k, v, row_ptr, col_idx, seq_lens):
         )
     else:
         # CPU fallback: manual fp32 path (same as prior best).
+        invalid_4d = key_invalid[:, :, None, :] | (
+            key_positions[:, :, None, :] > q_positions_per_block[None, :, :, None]
+        )
         scores = torch.matmul(q_chunks, gathered_k.transpose(-1, -2))
         scores.mul_(SCALE)
         scores.masked_fill_(invalid_4d, neg_inf)
