@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import contextvars
 import ctypes
+import inspect
 import os
 import pty
 import shutil
@@ -38,6 +39,14 @@ _ALLOWED_CTYPES_LIBRARY_PREFIXES = (
 )
 _ALLOWED_SUBPROCESS_COMMANDS = {
     ("ldconfig", "-p"),
+}
+_ALLOWED_HOST_COMPILER_BASENAMES = {
+    "c++",
+    "cc",
+    "clang",
+    "clang++",
+    "g++",
+    "gcc",
 }
 
 
@@ -96,6 +105,8 @@ def _is_allowed_subprocess_argv(argv: object) -> bool:
         return True
     if basename == "ptxas":
         return _is_allowed_ptxas_invocation(normalized)
+    if basename in _ALLOWED_HOST_COMPILER_BASENAMES:
+        return _is_allowed_triton_host_compiler_invocation(normalized)
     return False
 
 
@@ -130,9 +141,161 @@ def _is_allowed_ptxas_invocation(argv: tuple[str, ...]) -> bool:
     return len(argv) >= 2
 
 
+def _is_allowed_triton_host_compiler_invocation(argv: tuple[str, ...]) -> bool:
+    if not _is_trusted_subprocess_binary(argv[0], _ALLOWED_HOST_COMPILER_BASENAMES):
+        return False
+    if not _is_trusted_triton_launcher_build_context():
+        return False
+    source_paths, output_path = _extract_host_compiler_artifacts(argv)
+    if not source_paths or output_path is None:
+        return False
+    allowed_roots = _allowed_compiler_artifact_roots()
+    if not allowed_roots:
+        return False
+    if any(not _is_path_within_any_root(path, allowed_roots) for path in source_paths):
+        return False
+    if not _is_path_within_any_root(output_path, allowed_roots):
+        return False
+    return True
+
+
+def _extract_host_compiler_artifacts(argv: tuple[str, ...]) -> tuple[list[str], str | None]:
+    source_paths: list[str] = []
+    output_path: str | None = None
+    skip_next = False
+    for index, arg in enumerate(argv[1:], start=1):
+        if skip_next:
+            skip_next = False
+            continue
+        if arg == "-o" and index + 1 < len(argv):
+            output_path = argv[index + 1]
+            skip_next = True
+            continue
+        if arg.startswith("-o") and len(arg) > 2:
+            output_path = arg[2:]
+            continue
+        if arg.startswith("-"):
+            continue
+        suffix = Path(arg).suffix.lower()
+        if suffix in {".c", ".cc", ".cpp", ".cxx"}:
+            source_paths.append(arg)
+    return source_paths, output_path
+
+
+def _allowed_compiler_artifact_roots() -> tuple[Path, ...]:
+    roots: set[Path] = set()
+    for key in (
+        "TMPDIR",
+        "TMP",
+        "TEMP",
+        "TRITON_CACHE_DIR",
+        "TORCHINDUCTOR_CACHE_DIR",
+        "CUDA_CACHE_PATH",
+        "XDG_CACHE_HOME",
+    ):
+        value = os.environ.get(key)
+        if not value:
+            continue
+        try:
+            roots.add(Path(value).resolve())
+        except OSError:
+            continue
+    return tuple(sorted(roots))
+
+
+def _is_path_within_any_root(candidate: str, roots: tuple[Path, ...]) -> bool:
+    try:
+        resolved = Path(candidate).resolve()
+    except OSError:
+        return False
+    for root in roots:
+        try:
+            resolved.relative_to(root)
+        except ValueError:
+            continue
+        return True
+    return False
+
+
+def _is_trusted_triton_launcher_build_context() -> bool:
+    triton_root = _trusted_triton_root()
+    if triton_root is None:
+        return False
+    saw_build = False
+    saw_driver = False
+    frame = inspect.currentframe()
+    if frame is not None:
+        frame = frame.f_back
+    while frame is not None:
+        filename = frame.f_code.co_filename
+        relative = _relative_to_trusted_triton_root(filename, triton_root)
+        if _matches_triton_runtime_build_frame(relative):
+            saw_build = True
+        elif _matches_triton_nvidia_driver_frame(relative):
+            saw_driver = True
+        if saw_build and saw_driver:
+            return True
+        frame = frame.f_back
+    return False
+
+
+def _trusted_triton_root() -> Path | None:
+    try:
+        import triton
+    except ImportError:
+        return None
+    try:
+        return Path(triton.__file__).resolve().parent
+    except OSError:
+        return None
+
+
+def _relative_to_trusted_triton_root(filename: str, triton_root: Path) -> Path | None:
+    try:
+        resolved = Path(filename).resolve()
+    except OSError:
+        return None
+    try:
+        return resolved.relative_to(triton_root)
+    except ValueError:
+        return None
+
+
+def _matches_triton_runtime_build_frame(relative: Path | None) -> bool:
+    return _matches_triton_module_frame(relative, ("runtime",), "build")
+
+
+def _matches_triton_nvidia_driver_frame(relative: Path | None) -> bool:
+    return _matches_triton_module_frame(relative, ("backends", "nvidia"), "driver") or _matches_triton_module_frame(
+        relative,
+        ("third_party", "nvidia", "backend"),
+        "driver",
+    )
+
+
+def _matches_triton_module_frame(
+    relative: Path | None,
+    parent_parts: tuple[str, ...],
+    module_stem: str,
+) -> bool:
+    if relative is None:
+        return False
+    parts = relative.parts
+    if len(parts) >= len(parent_parts) + 1 and parts[: len(parent_parts)] == parent_parts:
+        tail = parts[len(parent_parts) :]
+        if len(tail) == 1 and tail[0] == f"{module_stem}.py":
+            return True
+        if len(tail) == 2 and tail[0] == "__pycache__" and tail[1].startswith(f"{module_stem}."):
+            return True
+    return False
+
+
 def _is_trusted_subprocess_binary(command: str, expected_basenames: set[str]) -> bool:
     path = _resolve_subprocess_command(command)
-    if path is None or path.name not in expected_basenames:
+    command_basename = os.path.basename(command)
+    if path is None or (
+        command_basename not in expected_basenames and path.name not in expected_basenames
+    ):
         return False
     for root in _trusted_subprocess_roots():
         try:
@@ -197,7 +360,10 @@ def _guarded_subprocess_callable(original: Callable, label: str) -> Callable:
         if _AUDIT_GUARD_ACTIVE.get() and not _is_allowed_subprocess_argv(argv):
             if _should_simulate_missing_subprocess(argv):
                 raise FileNotFoundError(f"{label} is unavailable in the submission sandbox.")
-            raise PolicyViolationError(f"{label} is not permitted during challenge evaluation.")
+            raise PolicyViolationError(
+                f"{label} is not permitted during challenge evaluation. "
+                f"argv={_format_subprocess_argv_for_error(argv)}"
+            )
         return original(*args, **kwargs)
 
     return _wrapped
@@ -208,10 +374,23 @@ def _guarded_posix_spawn_callable(original: Callable, label: str) -> Callable:
         if _AUDIT_GUARD_ACTIVE.get() and not _is_allowed_subprocess_argv(argv):
             if _should_simulate_missing_subprocess(argv):
                 raise FileNotFoundError(f"{label} is unavailable in the submission sandbox.")
-            raise PolicyViolationError(f"{label} is not permitted during challenge evaluation.")
+            raise PolicyViolationError(
+                f"{label} is not permitted during challenge evaluation. "
+                f"argv={_format_subprocess_argv_for_error(argv)}"
+            )
         return original(path, argv, env, *args, **kwargs)
 
     return _wrapped
+
+
+def _format_subprocess_argv_for_error(argv: object) -> str:
+    normalized = _normalize_subprocess_argv(argv)
+    if not normalized:
+        return "<unrecognized>"
+    head = list(normalized[:6])
+    if len(normalized) > 6:
+        head.append("...")
+    return repr(head)
 
 
 def _install_submission_audit_hook() -> None:
@@ -290,8 +469,16 @@ def submission_runtime_guard() -> Iterator[None]:
             stack.enter_context(
                 patch.object(subprocess, "run", _guarded_subprocess_callable(subprocess.run, "subprocess.run"))
             )
-            stack.enter_context(patch.object(subprocess, "call", _blocked_callable("subprocess.call")))
-            stack.enter_context(patch.object(subprocess, "check_call", _blocked_callable("subprocess.check_call")))
+            stack.enter_context(
+                patch.object(subprocess, "call", _guarded_subprocess_callable(subprocess.call, "subprocess.call"))
+            )
+            stack.enter_context(
+                patch.object(
+                    subprocess,
+                    "check_call",
+                    _guarded_subprocess_callable(subprocess.check_call, "subprocess.check_call"),
+                )
+            )
             stack.enter_context(
                 patch.object(
                     subprocess,
@@ -379,12 +566,16 @@ class CompilationCacheMonitor:
             "TORCHINDUCTOR_CACHE_DIR": str(self.root / "torchinductor"),
             "CUDA_CACHE_PATH": str(self.root / "cuda"),
             "XDG_CACHE_HOME": str(self.root / "xdg"),
+            "TMPDIR": str(self.root / "tmp"),
+            "TMP": str(self.root / "tmp"),
+            "TEMP": str(self.root / "tmp"),
             # Keep Inductor compilation in-process so setup-time compile support
             # does not require relaxing the subprocess sandbox for worker pools.
             "TORCHINDUCTOR_COMPILE_THREADS": "1",
         }
         self._old_env: dict[str, str | None] = {}
         self._baseline: CacheSnapshot | None = None
+        self._old_tempdir: str | None | object = None
 
     def __enter__(self) -> "CompilationCacheMonitor":
         for value in self._env_updates.values():
@@ -392,9 +583,12 @@ class CompilationCacheMonitor:
         for key, value in self._env_updates.items():
             self._old_env[key] = os.environ.get(key)
             os.environ[key] = value
+        self._old_tempdir = tempfile.tempdir
+        tempfile.tempdir = None
         return self
 
     def __exit__(self, exc_type, exc, tb) -> None:
+        tempfile.tempdir = self._old_tempdir
         for key, value in self._old_env.items():
             if value is None:
                 os.environ.pop(key, None)

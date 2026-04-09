@@ -174,9 +174,11 @@ have to stay inside the allowlist above.
   seeds Triton's fixed runtime helper cache outside the submission sandbox and
   keeps Inductor in single-process compile mode so the hosted H100 path can
   compile during `setup()`.
-- Direct custom Triton JIT kernels are still more restricted than
-  `torch.compile`, because Triton launcher generation wants host C compilation.
-  The sandbox still blocks that broader native-toolchain path.
+- Raw `@triton.jit` kernels are also supported during `setup()`. The sandbox
+  allows only the narrow Triton launcher build path: trusted host compilers,
+  trusted Triton build call sites, and launcher artifacts rooted under the
+  monitored cache/temp directory. Late compilation after setup is still
+  rejected by cache freezing.
 - Local `--serverlike` runs isolate submission execution and report setup device
   as `cuda` to catch some server-only setup surprises.
 - Modal-backed submission runs execute untrusted submission code in a separate
