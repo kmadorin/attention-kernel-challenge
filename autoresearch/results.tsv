@@ -1,0 +1,50 @@
+commit	status	tier_reached	cpu_ok	smoke_ok	quick_geo	quick_worst	full_geo	full_worst	full_sliding	full_global	full_retrieval	speedup_full	broad_geo	cost_usd_est	description
+a8bd777	full_invalid	3	true	true	19.0331	19.5890	-	-	-	-	-	-	-	1.90	idea E torch.compile baseline; tier3 setup failed (likely >30s warmup)
+8fb37a4	keep	3	true	true	17.6957	18.2096	38.9154	39.0118	-	-	-	-	-	1.90	hoist max_degree to one sync per call (constant inner-loop pad)
+b754809	keep	3	true	true	2.8774	3.2876	12.5433	14.2249	-	-	-	-	-	1.90	vectorize across q-blocks (one batched matmul)
+d13ce91	cpu_fail	0	false	-	-	-	-	-	-	-	-	-	-	0.00	bf16 matmuls broke CPU correctness (atol exceeded)
+32fbd3b	smoke_invalid	1	true	false	-	-	-	-	-	-	-	-	-	0.10	bf16 V-matmul on CUDA broke output atol on tier 1
+92431d0	keep	3	true	true	2.7925	3.1744	11.9350	13.5074	-	-	-	-	-	1.90	drop diag-block special case; single fused causal mask
+54dc4c4	keep	3	true	true	2.6240	2.9055	11.3636	12.7772	-	-	-	-	-	1.90	additive bias instead of bool mask + multiply
+538be19	keep	3	true	true	2.4491	2.7354	10.2084	11.5305	-	-	-	-	-	1.90	in-place ops on scores (skip 4D temporaries)
+6b8b448	keep	3	true	true	2.3069	2.6633	9.4423	10.6623	-	-	-	-	-	1.90	fuse mask conditions into single masked_fill_
+ba18e85	keep	3	true	true	2.2528	2.5334	9.2423	10.4070	-	-	-	-	-	1.90	drop query_invalid from score mask
+a12c2e7	smoke_invalid	1	true	false	-	-	-	-	-	-	-	-	-	0.10	Triton kernel: subprocess.check_call (cc) blocked by execution policy
+8f94976	discard	3	true	true	2.1344	2.3965	9.2996	10.4869	-	-	-	-	-	1.90	matmul -> bmm; not strictly better at full tier
+8d3f7b2	discard	3	true	true	2.2667	2.5612	9.3184	10.4844	-	-	-	-	-	1.90	preallocated out_blocks; not strictly better at full
+276d2d2	discard	3	true	true	2.2307	2.4683	9.3546	10.5467	-	-	-	-	-	1.90	torch.compile dynamic; .item() graph break prevents fusion
+fb5fd0d	discard	1	true	true	-	-	-	-	-	-	-	-	-	0.10	static MD adds padding waste; smoke 1.47 vs 1.13
+a6e3810	discard	2	true	true	2.5242	2.9115	-	-	-	-	-	-	-	0.40	fused softmax+logsumexp slower than manual in-place (reads scores 2x)
+a433c76	keep	3	true	true	1.7555	1.9940	7.3005	8.2225	-	-	-	-	-	1.90	aten._scaled_dot_product_efficient_attention fused kernel + lse
+542875f	smoke_invalid	1	true	false	-	-	-	-	-	-	-	-	-	0.10	bf16 SDPA out_max_abs_diff=0.0078 > atol 1e-3
+260c43f	discard	3	true	true	1.7440	1.9440	7.3133	8.2459	-	-	-	-	-	1.90	SDPA (B=bh H=nq) layout; not strictly better at full
+a4f0ba7	smoke_invalid	1	true	false	-	-	-	-	-	-	-	-	-	0.10	cuDNN SDPA returns inf with fp32 bias
+831b64c	keep	3	true	true	1.7187	1.9100	7.0325	7.8843	-	-	-	-	-	1.90	build attn_bias via torch.where single pass
+00c01ab	keep	3	true	true	1.7463	1.9844	6.8657	7.7214	-	-	-	-	-	1.90	return fp32 output (skip bf16 downcast)
+75e1ab3	discard	2	true	true	1.7926	1.9518	-	-	-	-	-	-	-	0.40	in-place masked_fill_ on SDPA output; regressed quick
+c55f2dc	discard	2	true	true	1.8574	2.1491	-	-	-	-	-	-	-	0.40	two masked_fill_ on bias; regressed quick vs single torch.where
+1a4353b	discard	2	true	true	1.7940	1.8427	-	-	-	-	-	-	-	0.40	4D key_valid layout; quick regression
+468c95a	discard	1	true	true	-	-	-	-	-	-	-	-	-	0.10	chunked SDPA by bh (32); Python-loop overhead hurt smoke
+2bd4a23	keep	3	true	true	1.5767	1.7300	5.7010	6.3296	-	-	-	-	-	1.90	fp16 SDPA tensor-core path (fused mem-eff kernel)
+3af230a	keep	3	true	true	1.5324	1.6250	4.2542	4.6606	-	-	-	-	-	1.90	cast q/k/v directly to fp16 on CUDA (skip fp32 round-trip)
+afaf48d	discard	3	true	true	1.4332	1.7835	4.2761	4.7590	-	-	-	-	-	1.90	in-place masked_fill_ on fp16 SDPA out; not strictly better
+04b6a90	keep	3	true	true	1.4542	1.5580	4.2225	4.7013	-	-	-	-	-	1.90	fuse post-mask with fp16->fp32 cast via multiply
+c57167e	discard	3	true	true	1.4683	1.5482	4.2683	4.7891	-	-	-	-	-	1.90	return fp16 output (skip fp32 cast); not strictly better
+9d79ae3	discard	3	true	true	1.3495	1.4346	4.4031	4.9346	-	-	-	-	-	1.90	where+masked_fill_ bias build; full regressed (extra pass)
+d4ed928	smoke_invalid	1	true	false	-	-	-	-	-	-	-	-	-	0.10	dual-SDPA: mem-eff bias rejects seqlen-Q broadcast (1)
+5b166ee	smoke_invalid	1	true	false	-	-	-	-	-	-	-	-	-	0.30	dual-SDPA stride-0 expand: SDPA accepts shape but merge math gives 3.02 max diff (logic bug; reverted)
+15f6cf8	keep	3	true	true	1.2157	1.2879	4.2064	4.6515	-	-	-	-	-	1.90	cache helper tensors (arange/positions) at module level
+3334b59	keep	3	true	true	1.1790	1.2408	4.1671	4.5991	-	-	-	-	-	1.90	skip gathered_block_indices zeroing where
+6cbeb5c	keep	3	true	true	1.1758	1.2952	4.0685	4.5611	-	-	-	-	-	1.90	cache scalar bias constants and slot_offsets
+72b742a	discard	2	true	true	1.3123	1.4522	-	-	-	-	-	-	-	0.40	drop int32->int64 casts; quick regressed
+0c8c490	discard	2	true	true	1.3021	1.3824	-	-	-	-	-	-	-	0.40	cache bias output buffer; quick regressed
+6bfbbe8	discard	2	true	true	1.3173	1.4963	-	-	-	-	-	-	-	0.40	in-place lse masked_fill_; quick regressed
+3f1005e	discard	2	true	true	1.2593	1.3545	-	-	-	-	-	-	-	0.40	(B=bh,H=nq) SDPA layout regressed quick on fp16 path too
+814e096	discard	2	true	true	1.4190	1.4474	-	-	-	-	-	-	-	0.40	setup-cached md from upper bound; over-allocates for retrieval; quick regressed
+5e2484b	discard	3	true	true	1.0752	1.1909	4.1475	4.6208	-	-	-	-	-	5.70	setup-cached md keyed by (shape,max_nnz); quick -8.5% but full not strictly better (3 runs: 4.36/4.08/4.15, var ~7%)
+278b3a6	discard	2	true	true	1.3632	1.4826	-	-	-	-	-	-	-	0.70	setup-cached md (re-test); quick variance ~15% defeats gate
+fb85cc6	full_invalid	3	true	true	1.1570	1.2231	-	-	-	-	-	-	-	1.90	precompute setup gather indices; cache collision broke retrieval case
+632db3a	discard	2	true	true	1.27	1.4973	-	-	-	-	-	-	-	0.70	prewarm SDPA in setup; no measurable win
+65b639f	discard	2	true	true	1.2823	1.3518	-	-	-	-	-	-	-	1.00	simulate harness in setup; cache hits but no quick win (sync wasnt bottleneck)
+b1e2388	discard	2	true	true	1.2484	1.3428	-	-	-	-	-	-	-	0.40	CUDA stream parallelism for gather; bandwidth contention regressed
+155c786	keep	3	true	true	1.1496	1.4401	4.0475	4.5804	-	-	-	-	-	6.60	wild: torch.compile dynamic the bias build (median 3 runs full=4.0654, quick=1.1496)
