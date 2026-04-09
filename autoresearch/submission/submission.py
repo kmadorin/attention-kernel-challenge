@@ -90,8 +90,11 @@ def block_sparse_attn_fwd(q, k, v, row_ptr, col_idx, seq_lens):
     # Q chunks: (bh, nq, BLOCK_SIZE, head_dim)
     q_chunks = q_f.reshape(batch_heads, nq, BLOCK_SIZE, head_dim)
 
-    # Scores: (bh, nq, BLOCK_SIZE, md*BLOCK_SIZE)
-    scores = torch.matmul(q_chunks, gathered_k.transpose(-1, -2)) * SCALE
+    # Scores: (bh, nq, BLOCK_SIZE, md*BLOCK_SIZE). The matmul result is the
+    # only fresh fp32 4D tensor we need; everything downstream mutates it
+    # in place to avoid extra ~2 GB temporaries on full-suite shapes.
+    scores = torch.matmul(q_chunks, gathered_k.transpose(-1, -2))
+    scores.mul_(SCALE)
 
     # --- Build the boolean mask -----------------------------------------------
     # Key absolute positions: (bh, nq, md*BLOCK_SIZE)
@@ -125,17 +128,21 @@ def block_sparse_attn_fwd(q, k, v, row_ptr, col_idx, seq_lens):
     key_bias = torch.where(key_valid, 0.0, neg_inf).to(torch.float32)  # (bh, nq, md*BS)
     query_bias = torch.where(query_valid, 0.0, neg_inf).to(torch.float32)  # (bh, nq, BS)
 
-    scores = scores + key_bias[:, :, None, :] + query_bias[:, :, :, None]
-    causal_ok = key_positions[:, :, None, :] <= q_positions_per_block[None, :, :, None]
-    scores = scores.masked_fill(~causal_ok, neg_inf)
+    scores.add_(key_bias[:, :, None, :])
+    scores.add_(query_bias[:, :, :, None])
+    # Build inverse causal directly (key_pos > q_pos) so we skip a `~` pass.
+    causal_violated = key_positions[:, :, None, :] > q_positions_per_block[None, :, :, None]
+    scores.masked_fill_(causal_violated, neg_inf)
 
     row_max = torch.max(scores, dim=-1).values  # (bh, nq, BLOCK_SIZE)
     valid_rows = query_valid & torch.isfinite(row_max)
     row_max_safe = torch.where(valid_rows, row_max, torch.zeros_like(row_max))
 
     # exp(-inf) = 0 → masked positions contribute 0 to sum and to exp@v, so no
-    # explicit mask multiply is needed.
-    exp_scores = torch.exp(scores - row_max_safe[:, :, :, None])
+    # explicit mask multiply is needed. Mutate `scores` in place.
+    scores.sub_(row_max_safe[:, :, :, None])
+    scores.exp_()
+    exp_scores = scores  # alias; `scores` is no longer needed
     denom = exp_scores.sum(dim=-1)  # (bh, nq, BLOCK_SIZE)
     denom_safe = torch.where(valid_rows, denom, torch.ones_like(denom))
 
