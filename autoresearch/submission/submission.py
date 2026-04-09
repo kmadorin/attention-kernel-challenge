@@ -37,6 +37,33 @@ def _get_helpers(nq: int, batch_heads: int, num_k_blocks: int, device):
     return cached
 
 
+_SCALAR_CACHE: dict = {}
+
+
+def _get_scalars(device):
+    cached = _SCALAR_CACHE.get(device)
+    if cached is not None:
+        return cached
+    neg_inf_h = torch.tensor(float("-inf"), device=device, dtype=torch.float16)
+    zero_h = torch.tensor(0.0, device=device, dtype=torch.float16)
+    cached = (neg_inf_h, zero_h)
+    _SCALAR_CACHE[device] = cached
+    return cached
+
+
+_SLOT_OFFSETS_CACHE: dict = {}
+
+
+def _get_slot_offsets(md: int, device):
+    key = (md, device)
+    cached = _SLOT_OFFSETS_CACHE.get(key)
+    if cached is not None:
+        return cached
+    cached = torch.arange(md, device=device, dtype=torch.int64)[None, None, :]
+    _SLOT_OFFSETS_CACHE[key] = cached
+    return cached
+
+
 def setup(suite_specs, device, variants):
     return None
 
@@ -83,8 +110,8 @@ def block_sparse_attn_fwd(q, k, v, row_ptr, col_idx, seq_lens):
     nq = num_q_blocks
     md = max_degree
 
-    # Slot offsets: (1, 1, md)
-    slot_offsets = torch.arange(md, device=device, dtype=torch.int64)[None, None, :]
+    # Slot offsets: (1, 1, md) — cached by md/device.
+    slot_offsets = _get_slot_offsets(md, device)
     # row_starts: (bh, nq, 1)
     row_starts = row_ptr_2d[:, :nq, None]
     # gather positions in the (bh, max_nnz) col_idx_2d table.
@@ -146,11 +173,8 @@ def block_sparse_attn_fwd(q, k, v, row_ptr, col_idx, seq_lens):
         # runs instead of the much slower fp32 fallback. fp16 has 11
         # mantissa bits → ~5e-4 quantization noise on the output, well
         # under the 1e-3 atol. LSE is still returned in fp32.
-        attn_bias = torch.where(
-            invalid_4d,
-            torch.tensor(neg_inf, device=device, dtype=torch.float16),
-            torch.tensor(0.0, device=device, dtype=torch.float16),
-        )
+        neg_inf_h, zero_h = _get_scalars(device)
+        attn_bias = torch.where(invalid_4d, neg_inf_h, zero_h)
         B = batch_heads * nq
         q_for_sdpa = q_chunks.reshape(B, 1, BLOCK_SIZE, head_dim)
         k_for_sdpa = gathered_k.reshape(B, 1, md * BLOCK_SIZE, head_dim)
