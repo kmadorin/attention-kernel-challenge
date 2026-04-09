@@ -148,14 +148,14 @@ def block_sparse_attn_fwd(q, k, v, row_ptr, col_idx, seq_lens):
             False,  # is_causal
             scale=SCALE,
         )
-        out_blocks = out_sdpa.to(torch.float32).reshape(batch_heads, nq, BLOCK_SIZE, head_dim)
+        # Zero invalid query rows by multiplying the fp16 SDPA output with
+        # the boolean query_valid mask before upcasting to fp32. This is one
+        # fused mul+cast pass instead of cast(2GB) + zeros_like(2GB) + where(2GB)
+        # = ~6 GB writes. Safe (no nan): SDPA bias only marks invalid KEYS,
+        # not invalid query rows, so SDPA never produces nan in those rows.
+        out_sdpa = out_sdpa.reshape(batch_heads, nq, BLOCK_SIZE, head_dim)
+        out_blocks = (out_sdpa * query_valid[:, :, :, None]).to(torch.float32)
         lse_blocks = lse_sdpa.reshape(batch_heads, nq, BLOCK_SIZE)
-        # Zero / -inf invalid query rows (SDPA may leak garbage into them).
-        out_blocks = torch.where(
-            query_valid[:, :, :, None],
-            out_blocks,
-            torch.zeros_like(out_blocks),
-        )
         lse_blocks = torch.where(
             query_valid,
             lse_blocks,
