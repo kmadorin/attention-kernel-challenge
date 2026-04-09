@@ -125,15 +125,14 @@ def block_sparse_attn_fwd(q, k, v, row_ptr, col_idx, seq_lens):
     # exp(-inf)=0 makes the post-softmax zeroing automatic, saving an entire
     # 4D fp32 allocation and a pointwise multiply pass over it.
     neg_inf = float("-inf")
-    # Fuse all three invalidation conditions (key padding, query padding,
-    # causal violation) into a single boolean 4D tensor and apply with one
-    # masked_fill_. Saves two fp32 4D read-write passes vs separate add_ ops.
+    # Combine key padding + causal violation into one boolean 4D tensor and
+    # apply with a single masked_fill_. We deliberately drop the query_invalid
+    # term: the post-loop zeroing of out_blocks/lse_blocks already handles
+    # invalid query rows, so masking them in `scores` would just be redundant
+    # bandwidth.
     key_invalid = ~key_valid  # (bh, nq, md*BS) bool
-    query_invalid = ~query_valid  # (bh, nq, BS) bool
-    invalid_4d = (
-        key_invalid[:, :, None, :]
-        | query_invalid[:, :, :, None]
-        | (key_positions[:, :, None, :] > q_positions_per_block[None, :, :, None])
+    invalid_4d = key_invalid[:, :, None, :] | (
+        key_positions[:, :, None, :] > q_positions_per_block[None, :, :, None]
     )
     scores.masked_fill_(invalid_4d, neg_inf)
 
