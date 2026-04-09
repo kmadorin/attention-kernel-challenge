@@ -114,22 +114,28 @@ def block_sparse_attn_fwd(q, k, v, row_ptr, col_idx, seq_lens):
     query_valid = q_positions_per_block[None, :, :] < seq_lens_2d[:, None, None]  # (bh, nq, BLOCK_SIZE)
 
     # cases.py guarantees col_idx[q_block] only contains blocks <= q_block, so
-    # an unconditional `key_pos <= q_pos` check is a no-op for non-diagonal
+    # the unconditional `key_pos <= q_pos` check is a no-op for non-diagonal
     # blocks and correctly enforces causal masking inside the diagonal block.
-    # We fold all conditions into a single (bh, nq, BLOCK_SIZE_q, md*BLOCK_SIZE_k)
-    # boolean built in one fused expression to minimize intermediate allocations.
-    mask = (
-        key_valid[:, :, None, :]
-        & query_valid[:, :, :, None]
-        & (key_positions[:, :, None, :] <= q_positions_per_block[None, :, :, None])
-    )
+    #
+    # Instead of building a boolean mask + masked_fill + (exp_scores * mask),
+    # we add an additive bias that is 0 where allowed and -inf where not.
+    # exp(-inf)=0 makes the post-softmax zeroing automatic, saving an entire
+    # 4D fp32 allocation and a pointwise multiply pass over it.
+    neg_inf = float("-inf")
+    key_bias = torch.where(key_valid, 0.0, neg_inf).to(torch.float32)  # (bh, nq, md*BS)
+    query_bias = torch.where(query_valid, 0.0, neg_inf).to(torch.float32)  # (bh, nq, BS)
 
-    scores = scores.masked_fill(~mask, -torch.inf)
+    scores = scores + key_bias[:, :, None, :] + query_bias[:, :, :, None]
+    causal_ok = key_positions[:, :, None, :] <= q_positions_per_block[None, :, :, None]
+    scores = scores.masked_fill(~causal_ok, neg_inf)
+
     row_max = torch.max(scores, dim=-1).values  # (bh, nq, BLOCK_SIZE)
     valid_rows = query_valid & torch.isfinite(row_max)
     row_max_safe = torch.where(valid_rows, row_max, torch.zeros_like(row_max))
 
-    exp_scores = torch.exp(scores - row_max_safe[:, :, :, None]) * mask.to(torch.float32)
+    # exp(-inf) = 0 → masked positions contribute 0 to sum and to exp@v, so no
+    # explicit mask multiply is needed.
+    exp_scores = torch.exp(scores - row_max_safe[:, :, :, None])
     denom = exp_scores.sum(dim=-1)  # (bh, nq, BLOCK_SIZE)
     denom_safe = torch.where(valid_rows, denom, torch.ones_like(denom))
 
