@@ -95,11 +95,9 @@ def block_sparse_attn_fwd(q, k, v, row_ptr, col_idx, seq_lens):
     gathered_block_indices = torch.gather(col_idx_expanded, 2, gather_positions)  # (bh, nq, md)
 
     slot_valid = slot_offsets < all_degrees[:, :, None]  # (bh, nq, md)
-    gathered_block_indices = torch.where(
-        slot_valid,
-        gathered_block_indices,
-        torch.zeros_like(gathered_block_indices),
-    )
+    # Skip the where: padding-slot indices stay clamped to col_idx[row_end-1]
+    # which is always a valid block index. The bias mask zeroes out their
+    # contribution anyway, so the wasted gather reads are inert.
 
     # Resolve to flat (bh*num_k_blocks) indices for K/V gather (bh_block_base
     # comes from the per-shape helper cache).
