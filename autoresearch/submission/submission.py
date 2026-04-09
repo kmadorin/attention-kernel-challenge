@@ -46,7 +46,19 @@ def block_sparse_attn_fwd(q, k, v, row_ptr, col_idx, seq_lens):
         torch.arange(batch_heads, device=device, dtype=torch.int64)[:, None] * num_k_blocks
     )
     block_token_offsets = torch.arange(BLOCK_SIZE, device=device, dtype=torch.int64)
-    slot_offsets_cache = {}
+
+    # Compute the maximum degree across ALL q_blocks once per call. This costs
+    # exactly one host/device sync per call (vs num_q_blocks syncs in the
+    # original loop) and lets us pad every q_block to the same `max_degree`,
+    # which keeps shapes constant inside the loop and lets the GPU pipeline
+    # actually run async between iterations.
+    all_degrees = row_ptr_2d[:, 1:] - row_ptr_2d[:, :-1]  # (bh, num_q_blocks)
+    max_degree = int(all_degrees.max().item())
+    if max_degree <= 0:
+        return output.reshape(batch_size, num_heads, t_max, head_dim).to(torch.bfloat16), lse.reshape(
+            batch_size, num_heads, t_max
+        )
+    slot_offsets = torch.arange(max_degree, device=device, dtype=torch.int64)[None, :]
 
     for q_block in range(num_q_blocks):
         q_start = q_block * BLOCK_SIZE
@@ -56,14 +68,6 @@ def block_sparse_attn_fwd(q, k, v, row_ptr, col_idx, seq_lens):
         row_start = row_ptr_2d[:, q_block]
         row_end = row_ptr_2d[:, q_block + 1]
         degrees = row_end - row_start
-        max_degree = int(degrees.max().item())
-        if max_degree <= 0:
-            continue
-
-        slot_offsets = slot_offsets_cache.get(max_degree)
-        if slot_offsets is None:
-            slot_offsets = torch.arange(max_degree, device=device, dtype=torch.int64)[None, :]
-            slot_offsets_cache[max_degree] = slot_offsets
 
         slot_valid = slot_offsets < degrees[:, None]
         gather_positions = torch.clamp(row_start[:, None] + slot_offsets, max=col_idx_2d.shape[1] - 1)
